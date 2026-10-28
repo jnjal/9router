@@ -37,7 +37,11 @@ const OPENCODE_CIPHER_LIST = [
 
 const DEFAULT_TIMEOUT_MS = 120000;
 
-let sessionPromise = null;
+// One wreq-js session per proxy URL. wreq-js binds the proxy to the session
+// transport at creation time, so a session created for proxy A must never be
+// reused for proxy B. This is especially important for Proxy Pool, where the
+// selected proxy can change between requests.
+const sessionPromises = new Map();
 
 export class OpencodeTlsUnavailableError extends Error {
   constructor(message) {
@@ -46,7 +50,23 @@ export class OpencodeTlsUnavailableError extends Error {
   }
 }
 
-async function loadSession() {
+function normalizeProxyUrl(proxyUrl) {
+  if (proxyUrl === undefined || proxyUrl === null) return "";
+  const value = String(proxyUrl).trim();
+  if (!value) return "";
+  try {
+    new URL(value);
+    return value;
+  } catch {
+    return `http://${value}`;
+  }
+}
+
+async function loadSession(proxyUrl = "") {
+  const normalizedProxy = normalizeProxyUrl(proxyUrl);
+  const cacheKey = normalizedProxy || "__direct__";
+
+  let sessionPromise = sessionPromises.get(cacheKey);
   if (!sessionPromise) {
     sessionPromise = (async () => {
       const wreq = await loadRuntimeDep("wreq-js");
@@ -54,34 +74,47 @@ async function loadSession() {
         throw new Error("wreq-js runtime is missing createSession");
       }
       return wreq.createSession({
+        ...(normalizedProxy ? { proxy: normalizedProxy } : {}),
         emulation: { tlsOptions: { cipherList: OPENCODE_CIPHER_LIST } },
       });
     })().catch((error) => {
-      sessionPromise = null;
+      sessionPromises.delete(cacheKey);
       throw error;
     });
+    sessionPromises.set(cacheKey, sessionPromise);
   }
+
   return sessionPromise;
 }
 
-/** Drop the cached session so the next call builds a fresh one. */
+/** Drop all cached sessions so the next call builds fresh transports. */
 export function resetOpencodeTlsSession() {
-  const pending = sessionPromise;
-  sessionPromise = null;
-  pending?.then((session) => session.close?.()).catch(() => {});
+  const pending = [...sessionPromises.values()];
+  sessionPromises.clear();
+  for (const promise of pending) {
+    promise.then((session) => session.close?.()).catch(() => {});
+  }
 }
 
 /**
  * Fetch through the impersonated-TLS session. Returns a native Response so
  * downstream `.body` / `.text()` / `.json()` consumers keep working unchanged.
  *
+ * `proxyUrl` is applied when the wreq-js session is created. This keeps the
+ * OpenCode TLS fingerprint and the Proxy Pool transport on the same request
+ * path instead of letting proxyFetch replace wreq-js with undici's ProxyAgent.
+ *
  * Streaming is preserved: the response body is handed over as the live
  * ReadableStream, never buffered.
  */
-export async function opencodeTlsFetch(url, init = {}, { signal, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function opencodeTlsFetch(
+  url,
+  init = {},
+  { signal, timeoutMs = DEFAULT_TIMEOUT_MS, proxyUrl = "" } = {}
+) {
   let session;
   try {
-    session = await loadSession();
+    session = await loadSession(proxyUrl);
   } catch (error) {
     throw new OpencodeTlsUnavailableError(
       `wreq-js unavailable (${error instanceof Error ? error.message : "unknown"}) — install the optional wreq-js dependency to reach the OpenCode free tier`
