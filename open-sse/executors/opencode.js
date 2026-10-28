@@ -403,20 +403,35 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   // The free gate keys on the TLS ClientHello, so a native Node fetch is refused
-  // no matter how faithful the body is. Route through the impersonating client
-  // and keep proxy handling on the existing path (proxyAwareFetch delegates to
-  // `directFetch` when no proxy is configured). Fail-open: without wreq-js the
-  // request still goes out on native fetch instead of erroring here.
+  // no matter how faithful the body is. Route through the impersonating client.
+  // When a 9Router Proxy Pool is configured, keep the proxy inside the wreq-js
+  // session itself. This is important because wreq-js binds the proxy transport
+  // at session creation time; letting proxyAwareFetch replace it with undici's
+  // ProxyAgent changes the OpenCode TLS fingerprint and causes the free gate to
+  // return 429.
   async execute(args) {
     const credentials = this.prepareRequestCredentials(args);
+    const proxyOptions = args?.proxyOptions || null;
+    const proxyUrl = proxyOptions?.connectionProxyEnabled === true
+      ? String(proxyOptions.connectionProxyUrl || "").trim()
+      : "";
+
+    if (proxyOptions?.strictProxy === true && !proxyUrl && !proxyOptions?.vercelRelayUrl) {
+      throw new Error("OpenCode requires a usable standard Proxy Pool URL when strict proxy mode is enabled");
+    }
+
+    // OpenCode handles the standard Proxy Pool itself through wreq-js. Do not
+    // pass the same proxy back into BaseExecutor/proxyAwareFetch, otherwise the
+    // latter would take over with undici before directFetch gets a chance.
     return super.execute({
       ...args,
       credentials,
+      proxyOptions: proxyUrl ? { connectionProxyEnabled: false } : null,
       directFetch: (url, options) => opencodeTlsFetch(url, {
         method: options.method,
         headers: options.headers,
         body: options.body,
-      }, { signal: options.signal }),
+      }, { signal: options.signal, proxyUrl }),
     });
   }
 
